@@ -1,0 +1,767 @@
+<!doctype html>
+<html>
+<head>
+ <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+ <title>Renderer viewer</title>
+  <!--
+    // Browser Renderer server
+    //   https://github.com/mganeko/browser_renderer_server
+    //   browser_mcu_server is provided under MIT license
+    //
+    //   This sample is using https://github.com/mganeko/browser_renderer_core
+    //
+  -->
+  <script src="js/pc_config.js"></script>
+  <script src="socket.io/socket.io.js"></script>
+</head>
+<body>
+  <h3>Browser Renderer Viewer</h3>
+  <label>Notice: <span id="notice_area" style="color:#44f; background-color:#ffa"></span></label><br />
+  &nbsp;
+  <button id="connect_button"  onclick="connect();">Connect</button>
+  <button id="disconnect_button"  onclick="disconnect();">Disconnect</button>
+  <br />remote video
+  &nbsp;
+  <button id="fullscreen_button"  onclick="toggleFullScreen();">Full Screen</button>
+  <button id="left"  onclick="view_left();">left</button>
+  <button id="center"  onclick="view_center();">center</button>
+  <button id="right"  onclick="view_right();">right</button>
+  <button id="default"  onclick="view_default();">default</button>
+  <br />
+  <div id="remote_container"></div>
+  <div>
+    <span id="state_span"></span>
+  </div>
+</body>
+<script type="text/javascript">
+  const useTrickleICE = true;
+
+  let remoteContainer = document.getElementById('remote_container');
+  let stateSpan = document.getElementById('state_span');
+  let localStream = null;
+  let peerConnection = null;
+  let peerPartnerId = null;
+  let enteredRoom = false;
+  
+  // --- prefix -----
+  navigator.getUserMedia  = navigator.getUserMedia    || navigator.webkitGetUserMedia ||
+                            navigator.mozGetUserMedia || navigator.msGetUserMedia;
+  RTCPeerConnection = window.RTCPeerConnection || window.webkitRTCPeerConnection || window.mozRTCPeerConnection;
+  RTCSessionDescription = window.RTCSessionDescription || window.webkitRTCSessionDescription || window.mozRTCSessionDescription;
+
+  // --- notice ---
+  function setNotice(text) {
+    const noticeArea = document.getElementById('notice_area');
+    noticeArea.innerText = text;
+  }
+
+  // ----- use socket.io ---
+  //const socket = io.connect('/');
+  let socket = null;
+
+  function connectSocket() {
+    if (socket) {
+      console.warn('socket ALREADY connected. IGNORE');
+      return;
+    }
+    socket = io.connect('/');
+
+    socket.on('connect', function(evt) {
+      console.log('socket.io connected()');
+      const room = getRoomName();
+      setNotice('Connected to Server');
+      console.log('enter room=' + room);
+      socket.emit('enter', room);
+    });
+    socket.on('error', function(err) {
+      console.error('socket.io ERROR:', err);
+      setNotice('Sorry, Network ERROR');
+      enteredRoom = false;
+    });
+    socket.on('disconnect', function(evt) {
+      console.log('socket.io disconnect:', evt);
+      enteredRoom = false;
+    });
+    socket.on('welcome', function(evt) {
+      console.log('welcome:', evt);
+      enteredRoom = true;
+      setNotice('Entering room:' + getRoomName());
+
+      const waitForInvoke = evt.waitForInvoke;
+
+      // -- auto call --
+        if (waitForInvoke) {
+          //console.log('wait and call..');
+          //setTimeout(function() {
+          //  call();
+          //  updateButtons();
+          //}, 500);
+          console.log('wait for mcu ready..');
+          setNotice('Waitig for Room:' + getRoomName() + ' get ready');
+        }
+        else {
+          console.log('call now');
+          call();
+          updateButtons();
+        }
+    });
+    socket.on('not_ready', function(evt) {
+      console.warn('socket.io room not_ready:', evt);
+      console.log('-- force disconect. plese retry later');
+      setNotice('Room:'+ getRoomName() + ' is not ready. Please retry lager');
+      disconnectSocket();
+    });
+    socket.on('message', function(message) {
+      console.log('message:', message);
+      handleMessage(message);
+    });
+  }
+
+  function disconnectSocket() {
+    if (! socket) {
+      console.warn('socket NOT connected. IGNORE');
+      return;
+    }
+
+    socket.close();
+    socket = null;
+    enteredRoom = false;
+  }
+
+  function isSoccketConnected() {
+    if (socket) {
+      return true;
+    }
+    else {
+      return false;
+    }
+  }
+
+  function handleMessage(message) {
+    const from = message.from;
+  
+    if (message.type === 'call') {
+      console.log('ignore call');
+      return;
+
+      //peerPartnerId = from;
+      //sendJson({ type: 'response'} );
+    }
+    else if (message.type === 'response') {
+      // --- start offer ----
+      peerPartnerId = from;
+      makeOffer();
+    }
+    else if (message.type === 'mcu_ready') {
+      console.log('mcu_ready. call now');
+      call();
+      updateButtons();      
+    }
+    else if (message.type === 'callme') {
+      // --- request from MCU --
+      console.log('got callme from MCU:' + from);
+      if (peerPartnerId) {
+        console.warn('already connected, so ignore');
+        return;
+      }
+      if (! localStream) {
+        console.warn('localstream NOT READY, so ignore');
+        return;
+      }
+
+      // --- start offer ----
+      peerPartnerId = from;
+      makeOffer();
+    }
+    else if (message.type === 'offer') {
+      console.warn('got offer, but MUST NOT got it');
+      return;
+
+      // -- got offer ---
+      //console.log('Received offer ...');
+      //if (from !== peerPartnerId) {
+      //  console.warn('Offer from Wrong partner:' + from + ',  MUST BE:' + peerPartnerId);
+      //  return;
+      //}
+      //
+      //const offer = new RTCSessionDescription(message);
+      //setOffer(offer);
+    }
+    else if (message.type === 'answer') {
+      // --- got answer ---
+      console.log('Received answer ...');
+      if (from !== peerPartnerId) {
+        console.warn('Anser from Wrong partner:' + from + ',  MUST BE:' + peerPartnerId);
+        return;
+      }
+
+      const answer = new RTCSessionDescription(message);
+      setAnswer(answer);
+      setNotice('Connected room:' + getRoomName());
+    }
+    else if (message.type === 'candidate') {
+      // --- got ICE candidate ---
+      console.log('Received ICE candidate ...');
+      if (from !== peerPartnerId) {
+        console.warn('ICE candidate from Wrong partner:' + from + ',  MUST BE:' + peerPartnerId);
+        return;
+      }
+
+      let candidate = new RTCIceCandidate(message.ice);
+      console.log(candidate);
+      addIceCandidate(candidate);
+    }
+    else if (message.type === 'bye') {
+      console.log('-- remote peer disconnecting');
+      if (from !== peerPartnerId) {
+        console.warn('bye from Wrong partner:' + from + ',  MUST BE:' + peerPartnerId);
+        return;
+      }
+
+      if (peerConnection) {
+        let streams = peerConnection.getRemoteStreams();
+        for (let key in streams) {
+          let stream = streams[key];
+          removeRemoteVideo(stream.id);
+        }
+        peerConnection.close();
+        peerConnection = null;
+        peerPartnerId = null;
+      }
+
+      updateButtons();
+    }
+    else if (message.type === 'client_disconnect') {
+      console.log('-- remote peer disconnected');
+      if (from === peerPartnerId) {
+        console.error('=== MAY NOT COME HERE ===');
+
+        if (peerConnection) {
+          let streams = peerConnection.getRemoteStreams();
+          for (let key in streams) {
+            let stream = streams[key];
+            removeRemoteVideo(stream.id);
+          }
+          peerConnection.close();
+          peerConnection = null;
+          peerPartnerId = null;
+        }
+
+        updateButtons();
+      }
+    }
+    else if (message.type === 'mcu_disconnect') {
+      console.log('-- MCU disconnected');
+      if (from === peerPartnerId) {
+        if (peerConnection) {
+          let streams = peerConnection.getRemoteStreams();
+          for (let key in streams) {
+            let stream = streams[key];
+            removeRemoteVideo(stream.id);
+          }
+          peerConnection.close();
+          peerConnection = null;
+          peerPartnerId = null;
+        }
+
+        setNotice('Room closed. Please try later');
+        disconnectSocket();
+        updateButtons();
+      }
+    }
+  }
+
+  
+
+  // -----  signaling ----
+ 
+  /*
+  function sendSdp(sessionDescription) {
+    console.log('---sending sdp ---');
+    const jsonSDP = sessionDescription.toJSON();
+    console.log('sending SDP:', jsonSDP);
+
+    sendJson(jsonSDP);
+  }
+  */
+  function sendSdp(sessionDescription) {
+    console.log('---sending sdp ---');
+    const jsonSDP = sessionDescription.toJSON();
+    console.log('sending to:' + peerPartnerId + '  SDP:', jsonSDP);
+
+    sendJson(jsonSDP);
+  }
+
+  function sendIceCandidate(candidate) {
+    console.log('---sending ICE candidate ---');
+    const obj = { type: 'candidate', ice: candidate };
+    sendJson(obj);
+  }
+
+  function sendJson(json) {
+    // -- socket.io --
+    json.to = peerPartnerId;
+    socket.json.send(json);
+
+    // --- websocket --
+    //json.to = peerPartnerId;
+    //const message = JSON.stringify(json);
+    //ws.send(message);  
+  }
+
+  function broadcastJson(json) {
+    // -- socket.io --
+    socket.json.send(json);
+
+    // --- websocket --
+    //const message = JSON.stringify(json);
+    //ws.send(message);
+  }
+
+  function getRoomName() {
+      const search = window.location.search;
+      const re = new RegExp('room=([^&=]+)');
+      const results = re.exec(search);
+      let room = socket.id;
+      if (results) {
+          room = results[1];
+      }
+      return room;
+  }
+
+  // ----- band width -----
+  // for chrome
+  //audioBandwidth = 50; // kbps
+  //videoBandwidth = 256; // kbps
+  function setBandwidth(sdp, audioBandwidth, videoBandwidth) {
+    let sdpNew = sdp.replace(/a=mid:audio\r\n/g, 'a=mid:audio\r\nb=AS:' + audioBandwidth + '\r\n');
+    sdpNew = sdpNew.replace(/a=mid:video\r\n/g, 'a=mid:video\r\nb=AS:' + videoBandwidth + '\r\n');
+
+    //// -- trial for firefox, but not work between chrome - firefox --
+    //let sdpNew = sdp.replace(/a=mid:audio\r\n/g, 'a=mid:audio\r\nb=AS:' + audioBandwidth + '\r\n' + 'b=TIAS:' + audioBandwidth*1000 + '\r\n');
+    //sdpNew = sdpNew.replace(/a=mid:video\r\n/g, 'a=mid:video\r\nb=AS:' + videoBandwidth + '\r\n' + 'b=TIAS:' + videoBandwidth*1000 + '\r\n');
+    //// -- trial for firefox, but not work between chrome - firefox --
+
+    return sdpNew;
+  }
+
+  // ---------------------- connection handling -----------------------
+  function prepareNewConnection() {
+    let pc_config = _PeerConnectionConfig;
+    let peer = new RTCPeerConnection(pc_config);
+    // --- on get remote stream ---
+    // if ('ontrack' in peer) {
+    //   peer.ontrack = function(event) {
+    //     console.log('-- peer.ontrack()');
+    //     let stream = event.streams[0];
+    //     logStream('remotestream of ontrack()', stream);
+    //     if ( (stream.getVideoTracks().length > 0) && (stream.getAudioTracks().length > 0) ) {
+    //       addRemoteVideo(stream.id, stream);
+    //     }
+        
+    //   };
+    // }
+    // else {
+      peer.onaddstream = function(event) {
+        console.log('-- peer.onaddstream()');
+        let stream = event.stream;
+        logStream('remotestream of onaddstream()', stream);
+        
+        addRemoteVideo(stream.id, stream);
+      };
+    // }
+    // --- on get local ICE candidate
+    peer.onicecandidate = function (evt) {
+      if (evt.candidate) {
+        console.log(evt.candidate);
+        if (useTrickleICE) {
+          // Trickle ICE の場合は、ICE candidateを相手に送る
+          // send ICE candidate when using Trickle ICE
+          sendIceCandidate(evt.candidate);
+        }
+        else {
+          // Vanilla ICE の場合には、何もしない
+          // do NOTHING for Vanilla ICE
+        }
+      } else {
+        console.log('empty ice event');
+        if (useTrickleICE) {
+          // Trickle ICE の場合は、何もしない
+          // do NOTHING for Trickle ICE
+        }
+        else {
+          // Vanilla ICE の場合には、ICE candidateを含んだSDPを相手に送る
+          // send SDP with ICE candidtes when using Vanilla ICE
+          sendSdp(peer.localDescription);
+        }
+      }
+    };
+    // --- when need to exchange SDP ---
+    peer.onnegotiationneeded = function(evt) {
+      console.log('-- onnegotiationneeded() ---');
+      console.warn('--- IGNORE ---');
+    };
+    // --- other events ----
+    peer.onicecandidateerror = function (evt) {
+      console.error('ICE candidate ERROR:', evt);
+    };
+    peer.onsignalingstatechange = function() {
+      console.log('== signaling state=' + peer.signalingState);
+    };
+    peer.oniceconnectionstatechange = function() {
+      console.log('== ice connection state=' + peer.iceConnectionState);
+      showState('ice connection state=' + peer.iceConnectionState);
+      if (peer.iceConnectionState === 'disconnected') {
+        console.log('-- disconnected, but wait for re-connect --');
+      }
+      else if (peer.iceConnectionState === 'failed') {
+        console.log('-- failed, so give up --');
+        disconnect();
+      }
+    };
+    peer.onicegatheringstatechange = function() {
+      console.log('==***== ice gathering state=' + peer.iceGatheringState);
+    };
+    
+    peer.onconnectionstatechange = function() {
+      console.log('==***== connection state=' + peer.connectionState);
+    };
+    peer.onremovestream = function(event) {
+      console.log('-- peer.onremovestream()');
+      let stream = event.stream;
+      removeRemoteVideo(stream.id, stream);
+    };
+    
+    
+    return peer;
+  }
+
+  function setOffer(sessionDescription) {
+    if (peerConnection) {
+      console.log('peerConnection alreay exist, reuse it');
+    }
+    else {
+      console.log('prepare new PeerConnection');
+      peerConnection = prepareNewConnection();
+    }
+    peerConnection.setRemoteDescription(sessionDescription)
+    .then(function() {
+      console.log('setRemoteDescription(offer) succsess in promise');
+      makeAnswer();
+      updateButtons();
+    }).catch(function(err) {
+      console.error('setRemoteDescription(offer) ERROR: ', err);
+    });
+  }
+
+  function setAnswer(sessionDescription) {
+    if (! peerConnection) {
+      console.error('peerConnection NOT exist!');
+      return;
+    }
+
+    peerConnection.setRemoteDescription(sessionDescription)
+    .then(function() {
+      console.log('setRemoteDescription(offer) succsess in promise');
+      updateButtons();
+    }).catch(function(err) {
+      console.error('setRemoteDescription(offer) ERROR: ', err);
+    });
+  }
+
+  function makeOffer() {
+    console.log('sending Offer. Creating session description...' );
+    if (peerConnection) {
+      console.log('peerConnection alreay exist, reuse it');
+    }
+    else {
+      console.log('prepare new PeerConnection');
+      peerConnection = prepareNewConnection();
+    }
+
+    peerConnection.createOffer({
+      offerToReceiveVideo: true,
+      offerToReceiveAudio: true
+    })
+    .then(function (sessionDescription) {
+      console.log('createOffer() succsess in promise');
+
+      // -- limit bandwidth --
+      const audioBand = _PeerBandWidthConfig.bandwidth.audio; // kbps
+      const videoBand = _PeerBandWidthConfig.bandwidth.video; // kbps
+      let sdpLimit = setBandwidth(sessionDescription.sdp, audioBand, videoBand);
+      sessionDescription.sdp = sdpLimit;
+
+      return peerConnection.setLocalDescription(sessionDescription);
+    }).then(function() {
+      console.log('setLocalDescription() succsess in promise');
+      if (useTrickleICE) {
+        // -- Trickle ICE の場合は、初期SDPを相手に送る --
+        // send initial SDP when using Trickle ICE
+        sendSdp(peerConnection.localDescription);
+      }
+      else {
+        // -- Vanilla ICE の場合には、まだSDPは送らない --
+        // wait for ICE candidates for Vanilla ICE
+        //sendSdp(peerConnection.localDescription);
+      }
+    }).catch(function(err) {
+      console.error(err);
+    });
+  }
+
+  function makeAnswer() {
+    console.log('sending Answer. Creating session description...' );
+    if (! peerConnection) {
+      console.error('peerConnection NOT exist!');
+      return;
+    }
+    
+    peerConnection.createAnswer()
+    .then(function (sessionDescription) {
+      console.log('createAnswer() succsess in promise');
+
+      // -- limit bandwidth --
+      const audioBand = 64; // kbps
+      const videoBand = 512; // kbps
+      let sdpLimit = setBandwidth(sessionDescription.sdp, audioBand, videoBand);
+      sessionDescription.sdp = sdpLimit;
+
+      return peerConnection.setLocalDescription(sessionDescription);
+    }).then(function() {
+      console.log('setLocalDescription() succsess in promise');
+      if (useTrickleICE) {
+        // -- Trickle ICE の場合は、初期SDPを相手に送る --
+        // send initial SDP when using Trickle ICE
+        sendSdp(peerConnection.localDescription);
+      }
+      else {
+        // -- Vanilla ICE の場合には、まだSDPは送らない --
+        // wait for ICE candidates for Vanilla ICE
+        //sendSdp(peerConnection.localDescription);
+      }
+    }).catch(function(err) {
+      console.error(err);
+    });
+  }
+
+  function addIceCandidate(candidate) {
+    if (peerConnection) {
+      peerConnection.addIceCandidate(candidate);
+    }
+    else {
+      console.error('PeerConnection not exist!');
+      return;
+    }
+  }
+  
+  // start PeerConnection
+  function connect() {
+    connectSocket();
+
+    //call(); // not here
+
+    updateButtons();
+  }
+
+  function call() {
+    console.log('calling ..');
+    broadcastJson({type: "call"});
+  }
+  function view_left(){
+    const obj = { type: 'setangle', data: 1 };
+    sendJson(obj);
+  }
+  function view_center(){
+    const obj = { type: 'setangle', data: 2 };
+    sendJson(obj);
+  }
+  function view_right(){
+    const obj = { type: 'setangle', data: 3 };
+    sendJson(obj);
+  }
+  function view_default(){
+    const obj = { type: 'setangle', data: 0 };
+    sendJson(obj);
+  }
+  
+  // close PeerConnection
+  function disconnect() {
+    broadcastJson({type: "bye"});
+    
+    if (peerConnection) {
+      console.log('Hang up.');
+      peerConnection.close();
+      peerConnection = null;
+      
+      removeAllRemoteVideo();
+    }
+    else {
+      console.warn('peer NOT exist.');
+    }
+
+    peerPartnerId = null;
+
+    disconnectSocket();
+    updateButtons();
+ 
+    setNotice('Exit from room');
+  }
+  
+  function showState(state) {
+    stateSpan.innerText = state;
+  }
+
+  function logStream(msg, stream) {
+    console.log(msg + ': id=' + stream.id);
+
+    let videoTracks = stream.getVideoTracks();
+    if (videoTracks) {
+    console.log('videoTracks.length=' + videoTracks.length);
+    videoTracks.forEach(function(track) {
+      console.log(' track.id=' + track.id);
+    });
+    }
+    
+    let audioTracks = stream.getAudioTracks();
+    if (audioTracks) {
+    console.log('audioTracks.length=' + audioTracks.length);
+    audioTracks.forEach(function(track) {
+      console.log(' track.id=' + track.id);
+    });
+    }
+  }
+ 
+  function addRemoteVideo(id, stream) {
+    let element = document.createElement('video');
+    remoteContainer.appendChild(element);
+    element.id = 'remote_' + id;
+    element.width = 480; //320;
+    element.height = 360; //240;
+    element.srcObject = stream;
+    element.play();
+    element.volume = 1.0;
+    element.controls = true;
+  }
+  
+  function removeRemoteVideo(id, stream) {
+    console.log(' ---- removeRemoteVideo() id=' + id);
+    let element = document.getElementById('remote_' + id);
+    if (element) {
+      element.pause();
+      element.srcObject = null;
+      remoteContainer.removeChild(element);
+    }
+    else {
+      console.log('child element NOT FOUND');
+    }
+  }
+
+  function removeAllRemoteVideo() {
+    while (remoteContainer.firstChild) {
+      remoteContainer.firstChild.pause();
+      remoteContainer.firstChild.srcObject = null;
+      remoteContainer.removeChild(remoteContainer.firstChild);
+    }
+  }
+
+  function getFirstRemoteVideo() {
+    return remoteContainer.firstChild;
+  }
+
+  function updateButtons() {
+    if (peerConnection) {
+      disableElement('connect_button');
+      enabelElement('disconnect_button');
+      disableElement('plan_b_check');
+    }
+    else {
+      enabelElement('connect_button');
+      disableElement('disconnect_button');
+      enabelElement('plan_b_check');
+    }
+  }
+
+  function enabelElement(id) {
+    let element = document.getElementById(id);
+    if (element) {
+      element.removeAttribute('disabled');
+    }
+  }
+
+  function disableElement(id) {
+    let element = document.getElementById(id);
+    if (element) {
+      element.setAttribute('disabled', '1');
+    }    
+  }
+
+  function toggleFullScreen() {
+    const fullscreen = document.fullscreenElement || document.webkitFullscreenElement || document.mozFullscreenElement || document.mozFullScreenElement;
+    if (fullscreen) {
+      // --- exit fullscreen ---
+      if (document.exitFullscreen) {
+        document.exitFullscreen();
+      }
+      else if (document.webkitExitFullscreen) {
+         document.webkitExitFullscreen();
+      }
+      else if (document.moztExitFullscreen) {
+        document.moztExitFullscreen();
+      }
+      else if (document.mozCancelFullScreen) {
+        document.mozCancelFullScreen();
+      }
+
+      return;
+    }
+
+    // --- enter fullscreen ---
+    const remoteVideo = getFirstRemoteVideo();
+    if (remoteVideo) {
+      if (remoteVideo.requestFullscreen) {
+        remoteVideo.requestFullscreen();
+      }
+      else if (remoteVideo.webkitRequestFullscreen) {
+        remoteVideo.webkitRequestFullscreen();
+      }
+      else if (remoteVideo.mozRequestFullscreen) {
+        remoteVideo.mozRequestFullscreen();
+      }
+      else if (remoteVideo.mozRequestFullScreen) {
+        remoteVideo.mozRequestFullScreen();
+      }
+
+      // setTimeout(function() {
+      //   toggleFullScreen();
+      // }, 2000);
+    }
+  }
+  function onKeyDown ( event ) {
+
+    switch( event.keyCode ) {
+
+      case 38: /*up*/ view_default(); break;
+      case 87: /*W*/  view_default(); break;
+
+      case 40: /*down*/ view_center(); break;
+      case 83: /*S*/    view_center(); break;
+
+      case 37: /*left*/ view_left(); break;
+      case 65: /*A*/   view_left(); break;
+
+      case 39: /*right*/ view_right(); break;
+      case 68: /*D*/    view_right(); break;
+
+    }
+
+  }  
+
+
+  // --------- initial ------------
+
+  document.addEventListener( 'keydown', onKeyDown, false );
+  updateButtons();
+  console.log('=== ready ==='); 
+</script>
+</html>
