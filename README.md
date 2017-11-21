@@ -19,7 +19,8 @@
 #### Preparation / 準備
 
 ```
-git clone https://github.com/mganeko/renderer_server.git
+git clone https://github.com/mganeko/browser_renderer.git
+cd browser_renderer
 npm install
 ```
 
